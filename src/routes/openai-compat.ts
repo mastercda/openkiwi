@@ -91,16 +91,16 @@
 		        // Create or load session
 		        const sessionId = `oai-${Date.now()}-${Math.random().toString(36).substring(7)}`;
 		        let session = SessionManager.getSession(sessionId);
-		        if (!session) {
-		            const firstUserMessage = messages.find((m: any) => m.role === 'user');
-		            session = {
-		                id: sessionId,
-		                agentId: agentId,
-		                title: firstUserMessage?.content?.slice(0, 30) + '...' || 'New chat',
-	 	                messages: [],
-	 	                updatedAt: Date.now()
-	 	            };
-	 	        }
+				if (!session) {
+					const firstUserMessage = messages.find((m: any) => m.role === 'user');
+					session = {
+						id: sessionId,
+						agentId: agentId,
+						title: firstUserMessage && firstUserMessage.content ? `${firstUserMessage.content.slice(0, 30)}...` : 'New chat',
+						messages: [],
+						updatedAt: Date.now()
+					};
+				}
 	 	
 	 	        // Prepare payload: system prompt + messages
 	 	        const payload: any[] = [];
@@ -217,14 +217,14 @@
 	 	            });
 	 	
 	 	            // Clean response (remove reasoning tags)
-	 	            const cleanResponse = result.finalResponse.replace(/<(think|thought|reasoning)>[\s\S]*?<\/\1>/gi, '').replace(/<think>[\s\S]*?<\/\x66\x6f\x75\x72\x74\x65\x65\x6e>/gi, '.').trim();
-	 	
-	 	            // Save assistant response to session
-	 	            session.messages.push({
-	 	                role: 'assistant',
-	 	                content: result.finalResponse,
-	 	                timestamp: Math.floor(Date.now() / 1000)
-	 	            });
+					const cleanResponse = (result.finalResponse || '').replace(/<(think|thought|reasoning)>[\s\S]*?<\/\1>/gi, '').trim();
+
+					// Save assistant response (cleaned) to session
+					session.messages.push({
+						role: 'assistant',
+						content: cleanResponse,
+						timestamp: Math.floor(Date.now() / 1000)
+					});
 	 	            SessionManager.saveSession(session);
 	 	
 	 	            // Return OpenAI-compatible response
