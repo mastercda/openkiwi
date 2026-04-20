@@ -84,190 +84,170 @@ router.get('/models', (_req: Request, res: Response) => {
 
 // ─── POST /chat/completions ───────────────────────────────────────────────────
 router.post('/chat/completions', async (req: Request, res: Response) => {
+    const { model, messages, stream = false, max_tokens, temperature } = req.body ?? {};
+
+    // Validate required fields
+    if (!model || typeof model !== 'string') {
+        res.status(400).json(oaiError('Missing or invalid "model" field', 400));
+        return;
+    }
+    if (!Array.isArray(messages) || messages.length === 0) {
+        res.status(400).json(oaiError('Missing or invalid "messages" field', 400));
+        return;
+    }
+
+    // Resolve agent
+    const agentId = model;
+    const agent = AgentManager.getAgent(agentId);
+    if (!agent) {
+        res.status(404).json(oaiError(`Model "${agentId}" not found`, 404, 'model_not_found'));
+        return;
+    }
+
+    // Resolve provider config (mirrors Telegram.ts logic)
+    const currentConfig = loadConfig();
+    const providerName = agent.provider;
+    let providerConfig = currentConfig.providers.find(
+        (p: any) => p.model === providerName || p.description === providerName
+    );
+    if (!providerConfig && currentConfig.providers.length > 0) {
+        providerConfig = currentConfig.providers[0];
+        logger.log({
+            type: 'system', level: 'warn',
+            message: `OAI compat: using default provider ${providerConfig.model} for agent ${agentId} (configured provider "${providerName}" not found)`
+        });
+    }
+    if (!providerConfig) {
+        res.status(500).json(oaiError('No LLM provider configured', 500));
+        return;
+    }
+
+    const llmConfig = {
+        baseUrl: providerConfig.endpoint,
+        modelId: providerConfig.model,
+        apiKey: providerConfig.apiKey,
+        maxTokens: max_tokens ?? providerConfig.maxTokens,
+        supportsTools: !!providerConfig?.capabilities?.trained_for_tool_use,
+        ...(temperature !== undefined ? { temperature } : {}),
+    };
+
+    // Build payload: inject agent system prompt unless the caller already provided one
+    const hasSystemMessage = messages.some((m: any) => m.role === 'system');
+    const systemPrompt = agent.systemPrompt || currentConfig.global?.systemPrompt || 'You are a helpful AI assistant.';
+    const payload: any[] = [
+        ...(!hasSystemMessage ? [{ role: 'system', content: systemPrompt }] : []),
+        ...messages,
+    ];
+
     const completionId = `chatcmpl-${Date.now()}`;
     const created = Math.floor(Date.now() / 1000);
 
-    try {
-        const { model, messages, stream, max_tokens } = req.body as {
-            model?: string;
-            messages?: any[];
-            stream?: boolean;
-            max_tokens?: number;
+    // ── Streaming path ────────────────────────────────────────────────────────
+    if (stream) {
+        res.setHeader('Content-Type', 'text/event-stream');
+        res.setHeader('Cache-Control', 'no-cache');
+        res.setHeader('Connection', 'keep-alive');
+        res.flushHeaders();
+
+        // Helper to send one SSE event
+        const sendChunk = (delta: Record<string, any>, finishReason: string | null = null) => {
+            const chunk = {
+                id: completionId,
+                object: 'chat.completion.chunk',
+                created,
+                model: agentId,
+                choices: [{ index: 0, delta, finish_reason: finishReason }],
+            };
+            res.write(`data: ${JSON.stringify(chunk)}\n\n`);
         };
 
-        // ── Validate ──────────────────────────────────────────────────────────
-        if (!model) {
-            return res.status(400).json(oaiError('Missing required field: model', 400));
-        }
-        if (!messages || !Array.isArray(messages)) {
-            return res.status(400).json(oaiError('Missing required field: messages (must be an array)', 400));
-        }
+        // Role chunk first
+        sendChunk({ role: 'assistant' });
 
-        // ── Resolve agent (by id or name) ─────────────────────────────────────
-        let agentId = model;
-        let agent = AgentManager.getAgent(model);
-        if (!agent) {
-            for (const id of AgentManager.listAgents()) {
-                const a = AgentManager.getAgent(id);
-                if (a && (a.name.toLowerCase() === model.toLowerCase() || a.id.toLowerCase() === model.toLowerCase())) {
-                    agent = a;
-                    agentId = id;
-                    break;
-                }
-            }
-        }
-        if (!agent) {
-            return res.status(404).json(oaiError(`Model '${model}' not found`, 404, 'model_not_found'));
-        }
-
-        // ── Resolve provider ──────────────────────────────────────────────────
-        const currentConfig = loadConfig();
-        let providerConfig = currentConfig.providers.find(
-            (p: any) => p.model === agent!.provider || p.description === agent!.provider
-        );
-        if (!providerConfig && currentConfig.providers.length > 0) {
-            providerConfig = currentConfig.providers[0];
-            logger.log({ type: 'system', level: 'warn', message: `Using default provider for agent ${agentId}; '${agent.provider}' not found.` });
-        }
-        if (!providerConfig) {
-            return res.status(500).json(oaiError('No LLM provider configured', 500));
-        }
-
-        const llmConfig = {
-            baseUrl:       providerConfig.endpoint,
-            modelId:       providerConfig.model,
-            apiKey:        providerConfig.apiKey,
-            maxTokens:     max_tokens ?? providerConfig.maxTokens,
-            supportsTools: !!providerConfig?.capabilities?.trained_for_tool_use,
-        };
-
-        // ── Session ───────────────────────────────────────────────────────────
-        const sessionId = `oai-${Date.now()}-${Math.random().toString(36).substring(7)}`;
-        const firstUser = messages.find((m: any) => m.role === 'user');
-        const session = {
-            id: sessionId,
-            agentId,
-            title: firstUser?.content ? `${String(firstUser.content).slice(0, 30)}...` : 'New chat',
-            messages: [] as any[],
-            updatedAt: Date.now(),
-        };
-
-        // ── LLM payload ───────────────────────────────────────────────────────
-        const systemPrompt = agent.systemPrompt || currentConfig.global?.systemPrompt || 'You are a helpful AI assistant.';
-        const validMessages = messages.filter((m: any) => m.role !== 'reasoning');
-        const payload: any[] = [{ role: 'system', content: systemPrompt }, ...validMessages];
-
-        const tsNow = Math.floor(Date.now() / 1000);
-        for (const msg of validMessages) {
-            session.messages.push({ role: msg.role, content: msg.content, timestamp: tsNow });
-        }
-        SessionManager.saveSession(session);
-
-        // ── STREAMING ─────────────────────────────────────────────────────────
-        if (stream) {
-            res.setHeader('Content-Type', 'text/event-stream; charset=utf-8');
-            res.setHeader('Cache-Control', 'no-cache');
-            res.setHeader('Connection', 'keep-alive');
-            res.setHeader('X-Accel-Buffering', 'no');
-            res.flushHeaders();
-
-            // Role delta — required by OAI spec
-            res.write(`data: ${JSON.stringify({
-                id: completionId, object: 'chat.completion.chunk', created, model: agentId,
-                choices: [{ index: 0, delta: { role: 'assistant', content: '' }, finish_reason: null }],
-            })}\n\n`);
-
-            const abortController = new AbortController();
-            req.on('close', () => abortController.abort());
-
-            let fullResponse = '';
-
-            try {
-                const result = await execLoop({
-                    agentId,
-                    sessionId,
-                    llmConfig,
-                    messages: payload,
-                    visionEnabled: !!providerConfig?.capabilities?.vision,
-                    maxLoops: agent.maxLoops || 100,
-                    signToolUrls: true,
-                    agentToolsConfig: agent.tools,
-                    abortSignal: abortController.signal,
-                    onDelta: (content: string) => {
-                        fullResponse += content;
-                        res.write(`data: ${JSON.stringify({
-                            id: completionId, object: 'chat.completion.chunk', created, model: agentId,
-                            choices: [{ index: 0, delta: { content }, finish_reason: null }],
-                        })}\n\n`);
-                    },
-                });
-
-                // Final stop chunk + usage
-                res.write(`data: ${JSON.stringify({
-                    id: completionId, object: 'chat.completion.chunk', created, model: agentId,
-                    choices: [{ index: 0, delta: {}, finish_reason: 'stop' }],
-                    usage: result.usage,
-                })}\n\n`);
-                res.write('data: [DONE]\n\n');
-                res.end();
-
-                session.messages.push({
-                    role: 'assistant',
-                    content: cleanReasoning(fullResponse),
-                    timestamp: Math.floor(Date.now() / 1000),
-                });
-                SessionManager.saveSession(session);
-
-            } catch (err: any) {
-                logger.log({ type: 'error', level: 'error', message: `Streaming error: ${err.message}` });
-                if (!res.writableEnded) {
-                    res.write(`data: ${JSON.stringify({ error: { message: err.message, type: 'api_error', param: null, code: null } })}\n\n`);
-                    res.end();
-                }
-            }
-
-        // ── NON-STREAMING ─────────────────────────────────────────────────────
-        } else {
-            const result = await execLoop({
+        try {
+            // Use the native AsyncGenerator directly for streaming
+            const gen = runAgentLoop({
                 agentId,
-                sessionId,
+                sessionId: `oai-${agentId}-stream-${Date.now()}`,
                 llmConfig,
                 messages: payload,
                 visionEnabled: !!providerConfig?.capabilities?.vision,
-                maxLoops: agent.maxLoops || 100,
-                signToolUrls: true,
+                maxLoops: agent.maxLoops ?? 100,
+                signToolUrls: false,
                 agentToolsConfig: agent.tools,
             });
 
-            const cleanResponse = cleanReasoning(result.finalResponse);
+            if (typeof (gen as any).next === 'function') {
+                const asyncGen = gen as AsyncGenerator<string, AgentLoopResult, unknown>;
+                let step = await asyncGen.next();
+                while (!step.done) {
+                    if (step.value) {
+                        sendChunk({ content: step.value });
+                    }
+                    step = await asyncGen.next();
+                }
+                // step.value is AgentLoopResult — send usage in final chunk
+                const result = step.value as AgentLoopResult;
+                sendChunk({}, 'stop');
+                const doneChunk = {
+                    id: completionId,
+                    object: 'chat.completion.chunk',
+                    created,
+                    model: agentId,
+                    choices: [{ index: 0, delta: {}, finish_reason: 'stop' }],
+                    usage: result.usage,
+                };
+                res.write(`data: ${JSON.stringify(doneChunk)}\n\n`);
+            } else {
+                // Fallback: plain Promise (tsx/esbuild strips generator semantics)
+                const result = await (gen as unknown as Promise<AgentLoopResult>);
+                const cleaned = cleanReasoning(result.finalResponse);
+                sendChunk({ content: cleaned });
+                sendChunk({}, 'stop');
+            }
+        } catch (err) {
+            logger.log({ type: 'error', level: 'error', message: `OAI /chat/completions stream error: ${err}` });
+            const errorChunk = { error: { message: String(err), type: 'api_error' } };
+            res.write(`data: ${JSON.stringify(errorChunk)}\n\n`);
+        }
 
-            session.messages.push({
-                role: 'assistant',
-                content: cleanResponse,
-                timestamp: Math.floor(Date.now() / 1000),
-            });
-            SessionManager.saveSession(session);
+        res.write('data: [DONE]\n\n');
+        res.end();
+        return;
+    }
 
-            res.json({
-                id: completionId,
-                object: 'chat.completion',
-                created,
-                model: agentId,
-                choices: [{
+    // ── Non-streaming path ────────────────────────────────────────────────────
+    try {
+        const result = await execLoop({
+            agentId,
+            sessionId: `oai-${agentId}-${Date.now()}`,
+            llmConfig,
+            messages: payload,
+            visionEnabled: !!providerConfig?.capabilities?.vision,
+            maxLoops: agent.maxLoops ?? 100,
+            signToolUrls: false,
+            agentToolsConfig: agent.tools,
+        });
+
+        const content = cleanReasoning(result.finalResponse);
+
+        res.json({
+            id: completionId,
+            object: 'chat.completion',
+            created,
+            model: agentId,
+            choices: [
+                {
                     index: 0,
-                    message: { role: 'assistant', content: cleanResponse },
-                    logprobs: null,
+                    message: { role: 'assistant', content },
                     finish_reason: 'stop',
-                }],
-                usage: result.usage,
-            });
-        }
-
-    } catch (err: any) {
-        logger.log({ type: 'error', level: 'error', message: `Chat completions error: ${err.message}` });
-        if (!res.headersSent) {
-            res.status(500).json(oaiError(`Internal server error: ${err.message}`, 500));
-        }
+                },
+            ],
+            usage: result.usage,
+        });
+    } catch (err) {
+        logger.log({ type: 'error', level: 'error', message: `OAI /chat/completions error: ${err}` });
+        res.status(500).json(oaiError(`Agent loop failed: ${err}`, 500));
     }
 });
 
