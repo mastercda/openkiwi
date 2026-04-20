@@ -1,11 +1,40 @@
 import express, { Request, Response } from 'express';
 import { AgentManager } from '../agent-manager.js';
-import { runAgentLoop, AgentLoopResult } from '../agent-loop.js';
+import { runAgentLoop, AgentLoopResult, AgentLoopOptions } from '../agent-loop.js';
 import { loadConfig } from '../config-manager.js';
 import { SessionManager } from '../session-manager.js';
 import { logger } from '../logger.js';
 
 const router = express.Router();
+
+/**
+ * Execute the agent loop and return AgentLoopResult.
+ *
+ * runAgentLoop is typed as AsyncGenerator<string, AgentLoopResult>.
+ * With target=ESNext + Node.js, it is a **real native AsyncGenerator** —
+ * awaiting it directly only gives back the generator object (body never runs).
+ * We must iterate it with .next() to run the body and collect the return value.
+ *
+ * tsx/esbuild may sometimes compile async generators to plain async functions
+ * (returns Promise<AgentLoopResult>). We detect that case by checking for
+ * a .next() method and handle both paths.
+ */
+async function execLoop(options: AgentLoopOptions): Promise<AgentLoopResult> {
+    const gen = runAgentLoop(options);
+
+    // Plain Promise path (tsx/esbuild strips generator semantics)
+    if (typeof (gen as any).next !== 'function') {
+        return (gen as unknown as Promise<AgentLoopResult>);
+    }
+
+    // Native AsyncGenerator path — iterate to completion
+    const asyncGen = gen as AsyncGenerator<string, AgentLoopResult, unknown>;
+    let step = await asyncGen.next();
+    while (!step.done) {
+        step = await asyncGen.next();
+    }
+    return step.value;
+}
 
 /** Strip reasoning/thinking tags from a model response. */
 function cleanReasoning(text: string): string {
@@ -14,7 +43,7 @@ function cleanReasoning(text: string): string {
         .trim();
 }
 
-/** Return an OpenAI-compatible error body. */
+/** OpenAI-compatible error body. */
 function oaiError(message: string, status: number, code?: string) {
     const typeMap: Record<number, string> = {
         400: 'invalid_request_error',
@@ -105,14 +134,14 @@ router.post('/chat/completions', async (req: Request, res: Response) => {
         }
 
         const llmConfig = {
-            baseUrl:      providerConfig.endpoint,
-            modelId:      providerConfig.model,
-            apiKey:       providerConfig.apiKey,
-            maxTokens:    max_tokens ?? providerConfig.maxTokens,
+            baseUrl:       providerConfig.endpoint,
+            modelId:       providerConfig.model,
+            apiKey:        providerConfig.apiKey,
+            maxTokens:     max_tokens ?? providerConfig.maxTokens,
             supportsTools: !!providerConfig?.capabilities?.trained_for_tool_use,
         };
 
-        // ── Build session ─────────────────────────────────────────────────────
+        // ── Session ───────────────────────────────────────────────────────────
         const sessionId = `oai-${Date.now()}-${Math.random().toString(36).substring(7)}`;
         const firstUser = messages.find((m: any) => m.role === 'user');
         const session = {
@@ -123,12 +152,11 @@ router.post('/chat/completions', async (req: Request, res: Response) => {
             updatedAt: Date.now(),
         };
 
-        // ── Build LLM payload ─────────────────────────────────────────────────
+        // ── LLM payload ───────────────────────────────────────────────────────
         const systemPrompt = agent.systemPrompt || currentConfig.global?.systemPrompt || 'You are a helpful AI assistant.';
         const validMessages = messages.filter((m: any) => m.role !== 'reasoning');
         const payload: any[] = [{ role: 'system', content: systemPrompt }, ...validMessages];
 
-        // Persist incoming messages to session
         const tsNow = Math.floor(Date.now() / 1000);
         for (const msg of validMessages) {
             session.messages.push({ role: msg.role, content: msg.content, timestamp: tsNow });
@@ -143,7 +171,7 @@ router.post('/chat/completions', async (req: Request, res: Response) => {
             res.setHeader('X-Accel-Buffering', 'no');
             res.flushHeaders();
 
-            // First chunk: role delta (OAI standard)
+            // Role delta — required by OAI spec
             res.write(`data: ${JSON.stringify({
                 id: completionId, object: 'chat.completion.chunk', created, model: agentId,
                 choices: [{ index: 0, delta: { role: 'assistant', content: '' }, finish_reason: null }],
@@ -155,8 +183,7 @@ router.post('/chat/completions', async (req: Request, res: Response) => {
             let fullResponse = '';
 
             try {
-                // Cast needed: tsx runs async generators as plain async functions at runtime
-                const result = await (runAgentLoop({
+                const result = await execLoop({
                     agentId,
                     sessionId,
                     llmConfig,
@@ -173,9 +200,9 @@ router.post('/chat/completions', async (req: Request, res: Response) => {
                             choices: [{ index: 0, delta: { content }, finish_reason: null }],
                         })}\n\n`);
                     },
-                }) as unknown as Promise<AgentLoopResult>);
+                });
 
-                // Final chunk: stop + usage
+                // Final stop chunk + usage
                 res.write(`data: ${JSON.stringify({
                     id: completionId, object: 'chat.completion.chunk', created, model: agentId,
                     choices: [{ index: 0, delta: {}, finish_reason: 'stop' }],
@@ -184,24 +211,24 @@ router.post('/chat/completions', async (req: Request, res: Response) => {
                 res.write('data: [DONE]\n\n');
                 res.end();
 
-                // Persist cleaned assistant response
                 session.messages.push({
                     role: 'assistant',
-                    content: cleanReasoning(result.finalResponse),
+                    content: cleanReasoning(fullResponse),
                     timestamp: Math.floor(Date.now() / 1000),
                 });
                 SessionManager.saveSession(session);
 
             } catch (err: any) {
                 logger.log({ type: 'error', level: 'error', message: `Streaming error: ${err.message}` });
-                res.write(`data: ${JSON.stringify({ error: { message: err.message, type: 'api_error', param: null, code: null } })}\n\n`);
-                res.end();
+                if (!res.writableEnded) {
+                    res.write(`data: ${JSON.stringify({ error: { message: err.message, type: 'api_error', param: null, code: null } })}\n\n`);
+                    res.end();
+                }
             }
 
         // ── NON-STREAMING ─────────────────────────────────────────────────────
         } else {
-            // Cast needed: tsx runs async generators as plain async functions at runtime
-            const result = await (runAgentLoop({
+            const result = await execLoop({
                 agentId,
                 sessionId,
                 llmConfig,
@@ -210,7 +237,7 @@ router.post('/chat/completions', async (req: Request, res: Response) => {
                 maxLoops: agent.maxLoops || 100,
                 signToolUrls: true,
                 agentToolsConfig: agent.tools,
-            }) as unknown as Promise<AgentLoopResult>);
+            });
 
             const cleanResponse = cleanReasoning(result.finalResponse);
 
@@ -245,4 +272,4 @@ router.post('/chat/completions', async (req: Request, res: Response) => {
 });
 
 export default router;
-	
+
