@@ -16,6 +16,11 @@ const router = express.Router();
 async function drainLoop(
     gen: AsyncGenerator<string, AgentLoopResult, unknown>
 ): Promise<AgentLoopResult> {
+    // runAgentLoop is typed as AsyncGenerator but may resolve as a plain Promise
+    // at runtime (e.g. when transpiled by tsx/esbuild). Handle both shapes.
+    if (typeof (gen as any).next !== 'function') {
+        return await (gen as unknown as Promise<AgentLoopResult>);
+    }
     let r: IteratorResult<string, AgentLoopResult>;
     while (!(r = await gen.next()).done) { /* deltas handled via onDelta callback */ }
     return r.value;
